@@ -326,3 +326,178 @@ def page_sql():
             st.dataframe(pd.DataFrame(out), use_container_width=True)
 
 
+def page_recovery():
+    st.header("Recovery Lab")
+    badge("measured")
+    st.caption("A child process runs transactions against the engine's write-ahead log and is killed with _exit() (no shutdown code). "
+               "The engine then restarts and recovers. This tests PROCESS crashes; power-loss behaviour is not tested.")
+    scenario = st.selectbox("Scenario", ["crash", "checkpoint", "torn_tail"], format_func={
+        "crash": "Crash with committed, rolled-back and in-flight transactions",
+        "checkpoint": "Crash after a checkpoint (snapshot + log tail)",
+        "torn_tail": "Half-written log record at the tail"}.get)
+    if st.button("Crash and recover", type="primary"):
+        r = guarded(lambda: ex.run_recovery_experiment(scenario))
+        if r:
+            (st.success if r["all_pass"] else st.error)(f"Experiment #{r['experiment_id']}: {sum(c['pass'] for c in r['checks'])}/{len(r['checks'])} checks passed")
+            rep = r["report"]
+            cols = st.columns(5)
+            for col, (label, key) in zip(cols, [("Log records", "records_scanned"), ("Redo applied", "redo_applied"), ("Undo applied", "undo_applied"),
+                                                ("Committed txns", "committed_txns"), ("Loser txns undone", "losers")]):
+                col.metric(label, rep[key])
+            st.dataframe(pd.DataFrame(r["checks"]), use_container_width=True, hide_index=True)
+    past = queries.history(category="recovery")
+    if not past.empty:
+        st.subheader("Past recovery runs")
+        def _checks(i):
+            lg = queries.logs_for(i)
+            lg = lg[lg.passed.notna()]
+            return f"{int(lg.passed.sum())}/{len(lg)} passed"
+        past["checks"] = past["experiment_id"].map(_checks)
+        st.dataframe(past[["experiment_id", "algorithm", "invariant_ok", "checks", "created_at"]], use_container_width=True, hide_index=True)
+
+
+def page_fs_disk():
+    st.header("File Allocation and Disk Scheduling Lab")
+    badge("sim")
+    t1, t2 = st.tabs(["Disk scheduling", "File allocation"])
+    with t1:
+        c1, c2, c3, c4 = st.columns(4)
+        reqs = c1.text_input("Request queue", "98,183,37,122,14,124,65,67")
+        head = c2.number_input("Head", 0, 100000, 53)
+        size = c3.number_input("Cylinders", 2, 100000, 200)
+        direction = c4.selectbox("Initial direction", ["up", "down"])
+        if st.button("Compare disk algorithms", type="primary"):
+            r = guarded(lambda: ex.run_disk_experiment(reqs, int(head), int(size), direction))
+            if r:
+                st.session_state["disk"] = r
+        r = st.session_state.get("disk")
+        if r:
+            df = pd.DataFrame([{k: x[k] for k in ("algorithm", "total_movement", "return_jump", "avg_movement_per_request")} for x in r["results"]]).round(2)
+            st.plotly_chart(px.bar(df, x="algorithm", y="total_movement", title="Total head movement (cylinders; circular variants include the return jump)"), use_container_width=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            csv_button(df, "disk_scheduling", "csv_disk")
+            pick = st.selectbox("Head path", [x["algorithm"] for x in r["results"]])
+            item = next(x for x in r["results"] if x["algorithm"] == pick)
+            fig = px.line(x=list(range(len(item["head_path"]))), y=item["head_path"], markers=True, labels={"x": "step", "y": "cylinder"},
+                          title=f"{pick}: service order {item['service_order']}")
+            st.plotly_chart(fig, use_container_width=True)
+    with t2:
+        c1, c2 = st.columns([1, 3])
+        blocks = c1.number_input("Disk blocks", 4, 5000, 32)
+        ops = c2.text_input("Operations (create:NAME:BLOCKS | remove:NAME)", "create:A:5,create:B:3,create:C:6,remove:B,create:D:4,create:E:5")
+        if st.button("Compare allocation methods", type="primary"):
+            r = guarded(lambda: ex.run_allocation_experiment(int(blocks), ops))
+            if r:
+                st.session_state["alloc"] = r
+        r = st.session_state.get("alloc")
+        if r:
+            df = pd.DataFrame([{k: x[k] for k in ("method", "used_blocks", "free_blocks", "overhead_blocks", "failed_creates",
+                                                  "external_fragmentation_pct", "avg_blocks_read_to_reach_last_block")} for x in r["results"]]).round(2)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            csv_button(df, "file_allocation", "csv_alloc")
+            pick = st.selectbox("Disk map", [x["method"] for x in r["results"]])
+            item = next(x for x in r["results"] if x["method"] == pick)
+            names = sorted({o for o in item["block_owner"] if o})
+            cmap = {n: i + 1 for i, n in enumerate(names)}
+            z = [cmap.get(o, 0) for o in item["block_owner"]]
+            per_row = 16
+            z += [None] * (-len(z) % per_row)
+            grid = [z[i:i + per_row] for i in range(0, len(z), per_row)]
+            text = [[(item["block_owner"][i * per_row + j] if i * per_row + j < len(item["block_owner"]) else "") or "·" for j in range(per_row)] for i in range(len(grid))]
+            fig = go.Figure(go.Heatmap(z=grid, text=text, texttemplate="%{text}", colorscale="Tealgrn", showscale=False, xgap=2, ygap=2))
+            fig.update_yaxes(autorange="reversed", visible=False); fig.update_xaxes(visible=False)
+            fig.update_layout(height=60 + 40 * len(grid), margin=dict(l=10, r=10, t=30, b=10), title="Block map ('·' free, name* = index block)")
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(pd.DataFrame(item["outcomes"])[["op", "name", "blocks_requested", "success", "message"]], use_container_width=True, hide_index=True)
+
+
+def page_performance():
+    st.header("Performance Analysis")
+    badge("measured")
+    runs = queries.transaction_runs()
+    if runs.empty:
+        st.info("No saved transaction experiments yet. Run one in the Transaction Lab (or the benchmark sweep).")
+        return
+    runs["workers"] = runs["workers"].astype(int)
+    st.caption(f"{len(runs)} saved real-engine runs. Each point is the mean of the runs for that policy and worker count. "
+               "Throughput does not always rise with workers: contention causes waits and aborts, and this engine has a single central lock table.")
+    wl = st.selectbox("Workload", sorted(runs.workload.unique()))
+    sel = runs[runs.workload == wl].copy()
+    sel["abort_rate"] = sel.aborted_attempts / (sel.committed + sel.aborted_attempts).replace(0, pd.NA)
+    agg = sel.groupby(["algorithm", "workers"], as_index=False).agg(throughput_tps=("throughput_tps", "mean"), abort_rate=("abort_rate", "mean"),
+                                                                      elapsed_ms=("elapsed_ms", "mean"), runs=("experiment_id", "count"))
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(px.line(agg, x="workers", y="throughput_tps", color="algorithm", markers=True, color_discrete_map=PALETTE,
+                            title="Successful throughput (committed txn/s)"), use_container_width=True)
+    c2.plotly_chart(px.line(agg, x="workers", y="abort_rate", color="algorithm", markers=True, color_discrete_map=PALETTE,
+                            title="Abort rate (aborted attempts / all attempts)"), use_container_width=True)
+    st.plotly_chart(px.bar(agg, x="workers", y="elapsed_ms", color="algorithm", barmode="group", color_discrete_map=PALETTE,
+                           title="Elapsed wall time (ms)"), use_container_width=True)
+    lat = queries.latency_percentiles(sel.experiment_id.tolist())
+    if not lat.empty:
+        lat = lat.groupby(["algorithm", "workers", "metric_name"], as_index=False).metric_value.mean()
+        st.plotly_chart(px.bar(lat[lat.metric_name == "p95_latency_us"], x="workers", y="metric_value", color="algorithm", barmode="group",
+                               color_discrete_map=PALETTE, title="p95 transaction latency (µs, includes retries)"), use_container_width=True)
+    bad = sel[sel.invariant_ok != 1]
+    if len(bad):
+        st.error(f"{len(bad)} run(s) violated the correctness invariant: {bad.experiment_id.tolist()}")
+    else:
+        st.success("Every plotted run passed its correctness invariant.")
+    st.dataframe(agg.round(3), use_container_width=True, hide_index=True)
+    csv_button(agg, "performance_summary", "csv_perf")
+
+
+def page_history():
+    st.header("Experiment History")
+    c1, c2, c3, c4 = st.columns(4)
+    cat = c1.selectbox("Category", ["(all)", "transaction", "deadlock", "recovery", "scheduling", "disk", "allocation", "os_deadlock", "sql_index"])
+    src = c2.selectbox("Source", ["(all)", "measured_engine", "measured_mysql", "simulator"])
+    algo = c3.text_input("Algorithm contains", "")
+    seeds = c4.checkbox("Include seed rows", False)
+    df = queries.history(None if cat == "(all)" else cat, None if src == "(all)" else src, None, seeds)
+    if algo:
+        df = df[df.algorithm.str.contains(algo, case=False, na=False)]
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    csv_button(df, "experiment_history", "csv_hist")
+    if not df.empty:
+        eid = st.selectbox("Inspect experiment", df.experiment_id.tolist())
+        row = queries.experiment_row(int(eid))
+        st.json({k: str(v) for k, v in row.items()})
+        m = queries.metrics_for([int(eid)])
+        st.dataframe(m[["metric_name", "metric_value", "unit"]], use_container_width=True, hide_index=True)
+        logs = queries.logs_for(int(eid))
+        if not logs.empty:
+            st.markdown("**Event log**"); st.dataframe(logs, use_container_width=True, hide_index=True)
+        jobs = queries.jobs_for(int(eid))
+        if not jobs.empty:
+            st.markdown("**Per-job results (simulated)**"); st.dataframe(jobs, use_container_width=True, hide_index=True)
+
+
+PAGES = {"Integrated Pipeline": page_pipeline, "Transaction Lab": page_transactions, "Concurrency & Deadlock Lab": page_deadlock, "CPU Scheduling Lab": page_scheduling,
+         "SQL & Indexing Lab": page_sql, "Recovery Lab": page_recovery, "File Allocation & Disk Lab": page_fs_disk,
+         "Performance Analysis": page_performance, "Experiment History": page_history}
+
+
+def main():
+    st.sidebar.title("IntelliTX")
+    st.sidebar.caption("Multithreaded Transaction Management and OS Resource Scheduling Analysis")
+    ok, info = database.ping()
+    if not ok:
+        st.sidebar.error("MySQL not reachable")
+        st.error(f"Cannot reach MySQL: {info}\n\nConfigure `.env` (see README) and run `python -m scripts.init_db`.")
+        st.stop()
+    st.sidebar.success(f"MySQL {info.split('-')[0]}")
+    if cli_path().exists():
+        st.sidebar.success("C++ engine found")
+    else:
+        st.sidebar.error("C++ engine not built")
+    page = st.sidebar.radio("Module", list(PAGES))
+    try:
+        database.query("SELECT 1 FROM experiments LIMIT 1")
+    except Exception:
+        st.warning("Schema missing. Run `python -m scripts.init_db` first.")
+        st.stop()
+    PAGES[page]()
+
+
+main()
