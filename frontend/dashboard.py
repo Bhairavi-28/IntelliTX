@@ -12,6 +12,7 @@ import streamlit as st
 
 from backend import database
 from backend.services import experiments as ex
+from backend.services import isolation as iso
 from backend.services import queries, sql_lab
 from backend.services.engine import EngineError, cli_path, run_cli
 
@@ -450,7 +451,7 @@ def page_performance():
 def page_history():
     st.header("Experiment History")
     c1, c2, c3, c4 = st.columns(4)
-    cat = c1.selectbox("Category", ["(all)", "transaction", "deadlock", "recovery", "scheduling", "disk", "allocation", "os_deadlock", "sql_index"])
+    cat = c1.selectbox("Category", ["(all)", "transaction", "deadlock", "recovery", "scheduling", "disk", "allocation", "os_deadlock", "sql_index", "isolation", "serializability"])
     src = c2.selectbox("Source", ["(all)", "measured_engine", "measured_mysql", "simulator"])
     algo = c3.text_input("Algorithm contains", "")
     seeds = c4.checkbox("Include seed rows", False)
@@ -473,7 +474,274 @@ def page_history():
             st.markdown("**Per-job results (simulated)**"); st.dataframe(jobs, use_container_width=True, hide_index=True)
 
 
-PAGES = {"Integrated Pipeline": page_pipeline, "Transaction Lab": page_transactions, "Concurrency & Deadlock Lab": page_deadlock, "CPU Scheduling Lab": page_scheduling,
+# ----------------------------------------------------------------------------- isolation & serializability
+
+STATUS_COLOR = {"done": "#16a34a", "blocked_then_done": "#f59e0b", "aborted": "#dc2626", "skipped": "#9ca3af", "pending": "#9ca3af"}
+STATUS_TEXT = {"done": "ran immediately", "blocked_then_done": "WAITED for a lock, then ran", "aborted": "rolled back",
+               "skipped": "skipped (txn already rolled back)", "pending": "did not finish"}
+
+
+def timeline_fig(run: dict, title: str) -> go.Figure:
+    """Swimlane: one lane per transaction, one bar per step from 'issued' to 'finished' (logical time)."""
+    fig = go.Figure()
+    seen = set()
+    for e in run["events"]:
+        start, end = e["issued_tick"], max(e["finished_tick"], e["issued_tick"] + 0.8)
+        status = e["status"]
+        fig.add_trace(go.Bar(
+            x=[end - start], y=[f"T{e['txn']}"], base=start, orientation="h",
+            marker_color=STATUS_COLOR.get(status, "#6b7280"), marker_line_width=0,
+            text=f"{e['step']}. {e['label']}", textposition="inside", insidetextanchor="start",
+            name=STATUS_TEXT.get(status, status), legendgroup=status, showlegend=status not in seen,
+            hovertemplate=f"<b>step {e['step']}: T{e['txn']} {e['label']}</b><br>{e['note']}<extra></extra>"))
+        seen.add(status)
+    fig.update_layout(barmode="overlay", height=230, margin=dict(l=10, r=10, t=40, b=10), title=title,
+                      xaxis_title="logical time (order in which steps were issued / finished)",
+                      yaxis=dict(categoryorder="array", categoryarray=["T2", "T1"]),
+                      legend=dict(orientation="h", y=-0.35))
+    return fig
+
+
+def precedence_dot(a: dict) -> str:
+    """Graphviz DOT of the precedence graph; edges on the cycle are red."""
+    cyc = a.get("cycle") or []
+    cyc_edges = {(cyc[i], cyc[(i + 1) % len(cyc)]) for i in range(len(cyc))} if cyc else set()
+    lines = ["digraph G {", "rankdir=LR; bgcolor=transparent;",
+             'node [shape=circle, style=filled, fillcolor="#e0e7ff", color="#4338ca", fontname="Helvetica", fontsize=14];',
+             'edge [fontname="Helvetica", fontsize=10, color="#475569"];']
+    on_cycle = ', fillcolor="#fee2e2", color="#dc2626"'
+    red_edge = ', color="#dc2626", fontcolor="#dc2626", penwidth=2.2'
+    for t in a["transactions"]:
+        extra = on_cycle if t in cyc else ""
+        lines.append(f'T{t} [label="T{t}"{extra}];')
+    for t in a["aborted"]:
+        lines.append(f'T{t} [label="T{t}' + r'\n' + '(aborted)", style="dashed", fillcolor="white", color="#9ca3af", fontcolor="#9ca3af"];')
+    busy = len(a["edges"]) > 10  # large graphs: label only the cycle edges (details are in the edge table)
+    for e in a["edges"]:
+        red = (e["from"], e["to"]) in cyc_edges
+        lab = f"{e['from_op']}{e['from']}({e['item']}) → {e['to_op']}{e['to']}({e['item']})"
+        if e["conflicts"] > 1:
+            lab += f"  ×{e['conflicts']}"
+        if busy and not red:
+            lab = ""
+        extra = red_edge if red else ""
+        lines.append(f'T{e["from"]} -> T{e["to"]} [label="{lab}"{extra}];')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def schedule_grid(a: dict, limit: int = 80) -> pd.DataFrame:
+    """Textbook layout: time runs downwards, one column per transaction."""
+    txns = sorted({o["txn"] for o in a["schedule"]})
+    rows = []
+    for o in a["schedule"][:limit]:
+        cell = o["op"] + (f"({o['item']})" if o["op"] in "RW" else "")
+        cell = {"C": "COMMIT", "A": "ABORT"}.get(o["op"], cell)
+        rows.append({"t": o["index"] + 1, **{f"T{t}": (cell if t == o["txn"] else "") for t in txns}})
+    return pd.DataFrame(rows)
+
+
+def analysis_panel(a: dict, key: str) -> None:
+    c = st.columns(5)
+    c[0].metric("Conflict-serializable", "yes" if a["conflict_serializable"] else "NO")
+    c[1].metric("View-serializable", a["view_serializable"])
+    c[2].metric("Recoverable", a["recoverable"])
+    c[3].metric("Cascadeless", a["cascadeless"])
+    c[4].metric("Strict", a["strict"])
+    if a["conflict_serializable"]:
+        order = " → ".join(f"T{t}" for t in a["serial_order"]) or "(no committed transaction)"
+        st.success(f"Acyclic precedence graph ⇒ equivalent to the serial schedule **{order}**.")
+    else:
+        cyc = " → ".join(f"T{t}" for t in a["cycle"] + a["cycle"][:1])
+        st.error(f"Cycle **{cyc}** in the precedence graph ⇒ NOT conflict-serializable (no serial order can respect every conflict).")
+    if a["view_note"]:
+        st.caption(f"View serializability: {a['view_note']}" + (f" (order {' → '.join('T' + str(t) for t in a['view_serial_order'])})" if a["view_serial_order"] and not a["conflict_serializable"] else ""))
+    if a["recoverability_note"]:
+        st.caption(f"Recoverability: {a['recoverability_note']}")
+    g, t = st.columns([3, 2])
+    with g:
+        st.markdown("**Precedence graph** (edge Ti → Tj: an operation of Ti conflicts with a LATER operation of Tj; ×n = n conflicting pairs)")
+        st.graphviz_chart(precedence_dot(a), use_container_width=True)
+    with t:
+        st.markdown("**Schedule** (time runs downwards)")
+        grid = schedule_grid(a)
+        st.dataframe(grid, use_container_width=True, hide_index=True, height=min(420, 38 + 35 * len(grid)))
+    if a["edges"]:
+        with st.expander("Why each edge exists"):
+            st.dataframe(pd.DataFrame([{"edge": f"T{e['from']} → T{e['to']}",
+                                        "first conflict": f"{e['from_op']}{e['from']}({e['item']}) at t={e['from_index'] + 1} before {e['to_op']}{e['to']}({e['item']}) at t={e['to_index'] + 1}",
+                                        "conflicting pairs": e["conflicts"]} for e in a["edges"]]),
+                         use_container_width=True, hide_index=True)
+
+
+def matrix_fig(runs: list[dict], title: str) -> go.Figure:
+    scen = [s for s in iso.SCENARIOS if any(r["scenario"] == s for r in runs)]
+    levels = [l for l in iso.LEVELS if any(r["isolation"] == l for r in runs)]
+    z, text = [], []
+    for s in scen:
+        zr, tr = [], []
+        for l in levels:
+            r = next((x for x in runs if x["scenario"] == s and x["isolation"] == l), None)
+            if r is None:
+                zr.append(None); tr.append("")
+            else:
+                zr.append(1 if r["anomaly"] else 0)
+                how = "ANOMALY" if r["anomaly"] else ("prevented (rollback)" if not (r["t1_committed"] and r["t2_committed"]) else
+                                                      "prevented (waited)" if any(e["waited"] for e in r["events"]) else "prevented")
+                tr.append(how)
+        z.append(zr); text.append(tr)
+    fig = go.Figure(go.Heatmap(z=z, x=[iso.LEVEL_NAMES[l] for l in levels], y=[iso.SCENARIO_TITLES[s] for s in scen],
+                               text=text, texttemplate="%{text}", colorscale=[[0, "#dcfce7"], [1, "#fecaca"]],
+                               zmin=0, zmax=1, showscale=False, xgap=3, ygap=3, hoverinfo="skip"))
+    fig.update_layout(title=title, height=110 + 55 * len(scen), margin=dict(l=10, r=10, t=40, b=10), yaxis_autorange="reversed")
+    return fig
+
+
+def page_isolation():
+    st.header("Isolation & Serializability Lab")
+    tab1, tab2, tab3 = st.tabs(["Anomaly Lab (isolation levels)", "Serializability Checker", "Live concurrent run"])
+
+    with tab1:
+        badge("measured")
+        st.markdown("Two transactions run on **real threads** in the C++ engine and their steps are issued in a fixed order, like two users typing into two SQL sessions. "
+                    "Lower isolation levels take **fewer / shorter shared locks**: READ UNCOMMITTED takes none, READ COMMITTED releases them right after each read, "
+                    "REPEATABLE READ keeps row locks but cannot lock rows that do not match yet, SERIALIZABLE also locks the scanned range.")
+        with st.form("iso_form"):
+            c1, c2, c3 = st.columns(3)
+            scenario = c1.selectbox("Anomaly scenario", ["all"] + iso.SCENARIOS,
+                                    format_func=lambda s: "All four anomalies" if s == "all" else iso.SCENARIO_TITLES[s])
+            level = c2.selectbox("Isolation level", ["all"] + iso.LEVELS,
+                                 format_func=lambda l: "All four levels" if l == "all" else iso.LEVEL_NAMES[l])
+            policy = c3.selectbox("Deadlock handling", ["detect", "wait_die", "no_wait"], format_func=POLICIES.get,
+                                  help="'detect' makes conflicting requests WAIT (textbook behaviour). Wait-Die / NO-WAIT prevent anomalies by rolling a transaction back instead.")
+            with_mysql = st.checkbox("Also run the same scenarios on MySQL (InnoDB) for comparison", value=False,
+                                     help="Uses two real MySQL connections. InnoDB uses MVCC snapshots, so its results differ from a pure locking engine.")
+            go_btn = st.form_submit_button("Run anomaly lab", type="primary")
+        if go_btn:
+            r = guarded(lambda: iso.run_isolation_experiment(scenario, level, policy, with_mysql))
+            if r:
+                st.session_state["iso"] = r
+                st.success(f"Experiment #{r['experiment_id']} saved: {len(r['engine'])} engine run(s)" + (f", {len(r['mysql'])} MySQL run(s)" if r["mysql"] else ""))
+        r = st.session_state.get("iso")
+        if r:
+            runs, mruns = r["engine"], r["mysql"]
+            if len(runs) > 1:
+                cols = st.columns(2 if mruns else 1)
+                cols[0].plotly_chart(matrix_fig(runs, f"IntelliTX engine (locking, policy {r['policy']})"), use_container_width=True)
+                if mruns:
+                    cols[1].plotly_chart(matrix_fig(mruns, "MySQL InnoDB (MVCC + locking)"), use_container_width=True)
+                if r["policy"] == "detect":
+                    match = all(x["anomaly"] == iso.TEXTBOOK[x["scenario"]][iso.LEVELS.index(x["isolation"])] for x in runs)
+                    (st.success if match else st.warning)(
+                        "The engine reproduces the SQL-standard table for locking isolation exactly." if match else
+                        "The engine result differs from the textbook table for at least one cell. Check the timeline of that cell.")
+                if mruns:
+                    st.info("Why MySQL differs: at READ COMMITTED and REPEATABLE READ, InnoDB answers plain SELECTs from an **MVCC snapshot** instead of taking shared locks. "
+                            "That is why its reads never wait, REPEATABLE READ shows no non-repeatable read or phantom, but a **lost update still happens** "
+                            "(the read-then-write pattern needs `SELECT … FOR UPDATE`). At SERIALIZABLE, InnoDB turns plain SELECTs into locking reads.")
+            labels = [f"{iso.SCENARIO_TITLES[x['scenario']]} @ {x['isolation_long']}" for x in runs]
+            pick = st.selectbox("Inspect one run", range(len(runs)), format_func=lambda i: labels[i]) if len(runs) > 1 else 0
+            run = runs[pick]
+            st.markdown(f"**{run['title']}**: {run['question']}")
+            (st.error if run["anomaly"] else st.success)(run["verdict"])
+            m = st.columns(4)
+            m[0].metric("T1", "committed" if run["t1_committed"] else "rolled back")
+            m[1].metric("T2", "committed" if run["t2_committed"] else "rolled back")
+            m[2].metric("Steps that waited", sum(1 for e in run["events"] if e["waited"]))
+            m[3].metric("Final values", ", ".join(f"{k}={v}" for k, v in zip(run["items"], run["final_values"])))
+            twin = next((x for x in mruns if x["scenario"] == run["scenario"] and x["isolation"] == run["isolation"]), None)
+            if twin:
+                a, b = st.columns(2)
+                a.plotly_chart(timeline_fig(run, "IntelliTX engine"), use_container_width=True)
+                b.plotly_chart(timeline_fig(twin, "MySQL InnoDB"), use_container_width=True)
+                (b.error if twin["anomaly"] else b.success)(twin["verdict"])
+            else:
+                st.plotly_chart(timeline_fig(run, "Timeline: green = ran at once, orange = waited for a lock, red = rolled back"), use_container_width=True)
+            st.dataframe(pd.DataFrame(run["events"])[["step", "txn", "label", "status", "note"]], use_container_width=True, hide_index=True)
+            st.markdown("##### The executed schedule, analysed")
+            analysis_panel(run["analysis"], key="iso_an")
+        with st.expander("Saved anomaly matrix in MySQL (view `v_anomaly_matrix`, latest result per cell)"):
+            mat = guarded(iso.latest_anomaly_matrix)
+            if mat:
+                st.dataframe(pd.DataFrame(mat), use_container_width=True, hide_index=True)
+                st.caption("X = anomaly happened, - = prevented. Built by a pivot query over the anomaly_results table.")
+
+    with tab2:
+        badge("sim")
+        st.markdown("Type any schedule in textbook notation, e.g. `R1(A) W2(A) R2(B) W1(B) C1 C2`. "
+                    "`R`/`W` = read/write of a data item, `C`/`A` = commit/abort. Aborted transactions are removed before the graph is built.")
+        ex_name = st.selectbox("Start from an example", list(iso.EXAMPLE_SCHEDULES))
+        text = st.text_area("Schedule", iso.EXAMPLE_SCHEDULES[ex_name], key=f"sched_{ex_name}", height=80)
+        save = st.checkbox("Save this analysis to MySQL", value=False)
+        if st.button("Analyze schedule", type="primary"):
+            a = guarded(lambda: iso.analyze_schedule(text, save=save))
+            if a:
+                st.session_state["sched_an"] = a
+        a = st.session_state.get("sched_an")
+        if a:
+            if a.get("experiment_id"):
+                st.caption(f"Saved as experiment #{a['experiment_id']}")
+            analysis_panel(a, key="chk")
+
+    with tab3:
+        badge("measured")
+        st.markdown("A small **real** concurrent workload: several threads run read-then-increment transactions on a few hot rows. "
+                    "The engine records every read, write, commit and abort in the order they took effect; the precedence graph is built from that history. "
+                    "At **SERIALIZABLE** the graph is always acyclic (the two-phase-locking theorem); at lower levels cycles and lost updates appear.")
+        with st.form("live_form"):
+            c1, c2, c3, c4 = st.columns(4)
+            lv = c1.selectbox("Isolation level", iso.LEVELS, index=3, format_func=iso.LEVEL_NAMES.get)
+            pol = c2.selectbox("Deadlock handling", ["detect", "wait_die", "no_wait"], format_func=POLICIES.get)
+            txns = c3.slider("Transactions", 2, 12, 6)
+            workers = c4.slider("Worker threads", 1, 8, 3)
+            c5, c6, c7, c8 = st.columns(4)
+            records = c5.slider("Hot rows", 1, 6, 3)
+            ops = c6.slider("Operations / txn", 1, 6, 3)
+            wr = c7.slider("Write ratio", 0.0, 1.0, 0.5, 0.1)
+            think = c8.slider("Think time (µs)", 0, 3000, 300, 100, help="Pause between operations; longer = more interleaving")
+            seed = st.number_input("Seed", 0, 100000, 7)
+            b1, b2 = st.columns(2)
+            run_one = b1.form_submit_button("Run at this level", type="primary")
+            run_all = b2.form_submit_button("Compare all four levels (same workload)")
+        opts = dict(policy=pol, txns=txns, workers=workers, records=records, ops=ops, write_ratio=wr, think_us=think, seed=int(seed))
+        if run_one:
+            r = guarded(lambda: iso.run_live_experiment(level=lv, **opts))
+            if r:
+                st.session_state["live"] = r
+                st.session_state.pop("live_all", None)
+        if run_all:
+            rs = guarded(lambda: [iso.run_live_experiment(level=l, **opts) for l in iso.LEVELS])
+            if rs:
+                st.session_state["live_all"] = rs
+                st.session_state["live"] = rs[-1]
+        rs = st.session_state.get("live_all")
+        if rs:
+            df = pd.DataFrame([{"level": iso.LEVEL_NAMES[x["isolation"]], "lost updates": x["lost_updates"],
+                                "aborted attempts": x["aborted_attempts"],
+                                "precedence-graph cycle": 0 if x["analysis"]["conflict_serializable"] else 1} for x in rs])
+            fig = px.bar(df.melt(id_vars="level", var_name="measure", value_name="count"), x="level", y="count", color="measure",
+                         barmode="group", title="Same workload, four isolation levels",
+                         color_discrete_map={"lost updates": "#dc2626", "aborted attempts": "#2563eb", "precedence-graph cycle": "#f59e0b"})
+            fig.update_layout(height=340, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Weaker isolation: fewer aborts (less blocking) but lost updates and non-serializable histories. Stronger isolation: correct, but more waiting and deadlock victims.")
+            pick = st.radio("Show the graph for", iso.LEVELS, index=3, horizontal=True, format_func=iso.LEVEL_NAMES.get)
+            st.session_state["live"] = rs[iso.LEVELS.index(pick)]
+        r = st.session_state.get("live")
+        if r:
+            st.caption(f"Experiment #{r['experiment_id']} · level {iso.LEVEL_NAMES[r['isolation']]} · policy {r['policy']}")
+            m = st.columns(4)
+            m[0].metric("Committed", r["committed"])
+            m[1].metric("Aborted attempts (retried)", r["aborted_attempts"])
+            m[2].metric("Lost / wrong updates", r["lost_updates"], help=f"{r['expected_increment']} committed +1 writes, but the rows only grew by {r['actual_increment']}")
+            m[3].metric("Conflict-serializable", "yes" if r["analysis"]["conflict_serializable"] else "NO")
+            analysis_panel(r["analysis"], key="live_an")
+            hist = pd.DataFrame(r["history"])
+            csv_button(hist, "live_history", "live_csv")
+
+
+PAGES = {"Integrated Pipeline": page_pipeline, "Transaction Lab": page_transactions, "Concurrency & Deadlock Lab": page_deadlock,
+         "Isolation & Serializability Lab": page_isolation, "CPU Scheduling Lab": page_scheduling,
          "SQL & Indexing Lab": page_sql, "Recovery Lab": page_recovery, "File Allocation & Disk Lab": page_fs_disk,
          "Performance Analysis": page_performance, "Experiment History": page_history}
 
