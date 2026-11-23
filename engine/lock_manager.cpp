@@ -227,6 +227,27 @@ void LockManager::release_all(TxnId txn) {
     cv_.notify_all();
 }
 
+void LockManager::release_shared(TxnId txn, Key key) {
+    if (policy_ == LockPolicy::NONE) return;
+    std::lock_guard<std::mutex> g(mu_);
+    auto e = table_.find(key);
+    if (e == table_.end()) return;
+    auto h = e->second.holders.find(txn);
+    if (h == e->second.holders.end() || h->second != LockMode::SHARED) return;
+    e->second.holders.erase(h);
+    if (e->second.holders.empty()) table_.erase(e);
+    auto t = txns_.find(txn);
+    if (t != txns_.end()) t->second.held.erase(key);
+    trace_locked("SHORT_LOCK_RELEASED", txn, "S lock on key " + std::to_string(key) + " released right after the read (READ COMMITTED)");
+    cv_.notify_all();
+}
+
+bool LockManager::is_waiting(TxnId txn) const {
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = txns_.find(txn);
+    return it != txns_.end() && it->second.waiting;
+}
+
 bool LockManager::holds(TxnId txn, Key key, LockMode at_least) const {
     std::lock_guard<std::mutex> g(mu_);
     auto e = table_.find(key);
