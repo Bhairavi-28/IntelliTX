@@ -4,9 +4,11 @@
 
 DROP VIEW IF EXISTS v_experiment_summary;
 DROP VIEW IF EXISTS v_policy_comparison;
+DROP VIEW IF EXISTS v_anomaly_matrix;
 DROP PROCEDURE IF EXISTS sp_record_metric;
 DROP PROCEDURE IF EXISTS sp_experiment_report;
 DROP PROCEDURE IF EXISTS sp_purge_experiments;
+DROP TABLE IF EXISTS anomaly_results;
 DROP TABLE IF EXISTS experiment_audit;
 DROP TABLE IF EXISTS job_results;
 DROP TABLE IF EXISTS transaction_logs;
@@ -19,7 +21,7 @@ CREATE TABLE experiments (
   experiment_id INT UNSIGNED NOT NULL AUTO_INCREMENT,
   name          VARCHAR(120) NOT NULL,
   category      ENUM('transaction','deadlock','recovery','scheduling','disk','allocation',
-                     'os_deadlock','sql_index') NOT NULL,
+                     'os_deadlock','sql_index','isolation','serializability') NOT NULL,
   -- measured_engine: real C++ engine / real MySQL timing; simulator: deterministic model.
   source        ENUM('measured_engine','simulator','measured_mysql') NOT NULL,
   algorithm     VARCHAR(40)  NOT NULL,            -- lock policy, scheduling algorithm, ...
@@ -106,7 +108,29 @@ CREATE TABLE experiment_metrics (
     ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
--- 6) experiment_audit: filled by a trigger when an experiment is deleted.
+-- 6) anomaly_results: one row per (engine, anomaly scenario, isolation level) of an isolation
+--    experiment. engine = 'intellitx' (our locking engine) or 'mysql' (InnoDB, MVCC + locking).
+CREATE TABLE anomaly_results (
+  anomaly_id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  experiment_id   INT UNSIGNED NOT NULL,
+  engine          ENUM('intellitx','mysql') NOT NULL,
+  scenario        ENUM('dirty_read','non_repeatable_read','lost_update','phantom') NOT NULL,
+  isolation_level ENUM('RU','RC','RR','SER') NOT NULL,
+  anomaly         TINYINT(1) NOT NULL,              -- 1 = the anomaly actually happened in this run
+  t1_committed    TINYINT(1) NOT NULL,
+  t2_committed    TINYINT(1) NOT NULL,
+  lock_waits      INT UNSIGNED NOT NULL DEFAULT 0,  -- steps that had to wait for a lock
+  conflict_serializable TINYINT(1) NULL,            -- precedence-graph verdict (engine runs only)
+  verdict         VARCHAR(600) NOT NULL,
+  PRIMARY KEY (anomaly_id),
+  UNIQUE KEY uq_anomaly (experiment_id, engine, scenario, isolation_level),
+  INDEX idx_anomaly_lookup (engine, scenario, isolation_level),
+  CONSTRAINT fk_anomaly_exp FOREIGN KEY (experiment_id) REFERENCES experiments(experiment_id)
+    ON DELETE CASCADE,
+  CONSTRAINT chk_anomaly_commit CHECK (anomaly = 0 OR (t1_committed + t2_committed) >= 1)
+) ENGINE=InnoDB;
+
+-- 7) experiment_audit: filled by a trigger when an experiment is deleted.
 CREATE TABLE experiment_audit (
   audit_id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   experiment_id INT UNSIGNED NOT NULL,          -- no FK on purpose: the parent row is gone
@@ -138,6 +162,20 @@ SELECT algorithm, workers, COUNT(*) AS runs,
 FROM v_experiment_summary
 WHERE category = 'transaction' AND status = 'COMPLETED' AND is_seed = 0
 GROUP BY algorithm, workers;
+
+-- Latest verdict per (engine, scenario, level): pivot to the textbook "anomaly vs isolation level" table.
+-- 'X' = anomaly happened, '-' = prevented, NULL = not run yet.
+CREATE VIEW v_anomaly_matrix AS
+SELECT a.engine, a.scenario,
+       MAX(CASE WHEN a.isolation_level = 'RU'  THEN IF(a.anomaly, 'X', '-') END) AS read_uncommitted,
+       MAX(CASE WHEN a.isolation_level = 'RC'  THEN IF(a.anomaly, 'X', '-') END) AS read_committed,
+       MAX(CASE WHEN a.isolation_level = 'RR'  THEN IF(a.anomaly, 'X', '-') END) AS repeatable_read,
+       MAX(CASE WHEN a.isolation_level = 'SER' THEN IF(a.anomaly, 'X', '-') END) AS serializable
+FROM anomaly_results a
+JOIN (SELECT engine, scenario, isolation_level, MAX(anomaly_id) AS last_id
+      FROM anomaly_results GROUP BY engine, scenario, isolation_level) latest
+  ON latest.last_id = a.anomaly_id
+GROUP BY a.engine, a.scenario;
 
 -- ---------------------------------------------------------------- triggers
 DELIMITER $$
