@@ -24,6 +24,7 @@ struct Transaction {
     TxnId id = 0;
     uint64_t timestamp = 0;
     TxnState state = TxnState::ACTIVE;
+    IsolationLevel isolation = IsolationLevel::SERIALIZABLE;
     Status abort_reason = Status::OK;
     std::vector<UndoEntry> undo_log;  // in-memory undo log (before-images), applied in reverse
     uint64_t reads = 0;
@@ -32,4 +33,4 @@ struct Transaction {
     std::chrono::steady_clock::time_point started_at;
 };
 
-}  // namespace itx
+} 
