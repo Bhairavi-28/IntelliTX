@@ -47,8 +47,14 @@ public:
     // AVOID policy only: declare every key the transaction may lock (its "maximum claim").
     void declare(TxnId txn, uint64_t timestamp, const std::vector<Key>& claim);
 
-    // Strict 2PL: the ONLY way locks are released is here, at commit/abort time.
+    // Strict 2PL: at SERIALIZABLE / REPEATABLE READ locks are released only here, at commit/abort.
     void release_all(TxnId txn);
+
+    // READ COMMITTED short lock: drops `txn`'s lock on `key` ONLY if it is a SHARED lock (an
+    // exclusive lock is always kept until commit). Breaks two-phase locking on purpose.
+    void release_shared(TxnId txn, Key key);
+
+    bool is_waiting(TxnId txn) const;  // is `txn` currently blocked inside acquire()?
 
     bool holds(TxnId txn, Key key, LockMode at_least) const;
     size_t locks_held(TxnId txn) const;
