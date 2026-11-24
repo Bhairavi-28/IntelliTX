@@ -48,4 +48,37 @@ bool parse_policy(const std::string& text, LockPolicy& out) {
     return true;
 }
 
+const char* to_string(IsolationLevel l) {
+    switch (l) {
+        case IsolationLevel::READ_UNCOMMITTED: return "RU";
+        case IsolationLevel::READ_COMMITTED: return "RC";
+        case IsolationLevel::REPEATABLE_READ: return "RR";
+        case IsolationLevel::SERIALIZABLE: return "SER";
+    }
+    return "?";
+}
+
+const char* long_name(IsolationLevel l) {
+    switch (l) {
+        case IsolationLevel::READ_UNCOMMITTED: return "READ UNCOMMITTED";
+        case IsolationLevel::READ_COMMITTED: return "READ COMMITTED";
+        case IsolationLevel::REPEATABLE_READ: return "REPEATABLE READ";
+        case IsolationLevel::SERIALIZABLE: return "SERIALIZABLE";
+    }
+    return "?";
+}
+
+bool parse_isolation(const std::string& text, IsolationLevel& out) {
+    for (IsolationLevel l : {IsolationLevel::READ_UNCOMMITTED, IsolationLevel::READ_COMMITTED,
+                             IsolationLevel::REPEATABLE_READ, IsolationLevel::SERIALIZABLE}) {
+        if (text == to_string(l) || text == long_name(l)) { out = l; return true; }
+    }
+    if (text == "read_uncommitted") out = IsolationLevel::READ_UNCOMMITTED;
+    else if (text == "read_committed") out = IsolationLevel::READ_COMMITTED;
+    else if (text == "repeatable_read") out = IsolationLevel::REPEATABLE_READ;
+    else if (text == "serializable") out = IsolationLevel::SERIALIZABLE;
+    else return false;
+    return true;
+}
+
 }  // namespace itx
