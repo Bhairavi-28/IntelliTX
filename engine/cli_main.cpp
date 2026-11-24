@@ -1,3 +1,5 @@
+// itx_cli: command-line front end of the IntelliTX engine. Every sub-command prints ONE JSON
+// document on stdout (errors: {"error": "..."} and exit code 2). The Python backend calls it.
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -8,10 +10,12 @@
 #include "deadlock_detector.h"
 #include "disk_scheduler.h"
 #include "file_allocation.h"
+#include "isolation_lab.h"
 #include "json_writer.h"
 #include "pipeline.h"
 #include "scenarios.h"
 #include "scheduler.h"
+#include "serializability.h"
 #include "workload.h"
 
 using namespace itx;
@@ -415,11 +419,141 @@ int cmd_osdeadlock(const Args& a) {
     return 0;
 }
 
+void emit_analysis(JsonWriter& w, const SerializabilityResult& r) {
+    w.begin_object();
+    w.field("schedule_text", format_schedule(r.schedule));
+    w.key("schedule").begin_array();
+    for (size_t i = 0; i < r.schedule.size(); ++i) {
+        const auto& o = r.schedule[i];
+        w.begin_object().field("index", static_cast<long>(i)).field("txn", static_cast<unsigned long long>(o.txn));
+        w.field("op", std::string(1, o.op)).field("item", o.item).end_object();
+    }
+    w.end_array();
+    w.int_array("transactions", r.transactions).int_array("aborted", r.aborted);
+    w.key("edges").begin_array();
+    for (const auto& e : r.edges) {
+        w.begin_object().field("from", static_cast<unsigned long long>(e.from)).field("to", static_cast<unsigned long long>(e.to));
+        w.field("item", e.item).field("from_op", std::string(1, e.from_op)).field("to_op", std::string(1, e.to_op));
+        w.field("from_index", static_cast<long>(e.from_index)).field("to_index", static_cast<long>(e.to_index));
+        w.field("conflicts", static_cast<long>(e.conflicts)).end_object();
+    }
+    w.end_array();
+    w.field("conflict_serializable", r.conflict_serializable);
+    w.int_array("cycle", r.cycle).int_array("serial_order", r.serial_order);
+    w.field("view_serializable", to_string(r.view_serializable)).int_array("view_serial_order", r.view_serial_order);
+    w.field("view_note", r.view_note);
+    w.field("recoverable", to_string(r.recoverable)).field("cascadeless", to_string(r.cascadeless));
+    w.field("strict", to_string(r.strict)).field("recoverability_note", r.recoverability_note);
+    w.end_object();
 }
+
+void emit_history(JsonWriter& w, const std::vector<HistoryOp>& h, const std::vector<std::string>& names) {
+    w.begin_array();
+    for (const auto& o : h) {
+        w.begin_object().field("seq", static_cast<unsigned long long>(o.seq)).field("txn", static_cast<unsigned long long>(o.txn));
+        w.field("op", std::string(1, o.op));
+        if (o.op == 'R' || o.op == 'W')
+            w.field("item", o.key < names.size() ? names[o.key] : "k" + std::to_string(o.key)).field("value", static_cast<long long>(o.value));
+        w.end_object();
+    }
+    w.end_array();
+}
+
+int cmd_isolation(const Args& a) {
+    LockPolicy policy;
+    if (!parse_policy(get(a, "policy", "detect"), policy)) throw std::invalid_argument("--policy must be wait_die|no_wait|detect");
+    std::string sc = get(a, "scenario", "all"), lv = get(a, "level", "all");
+    std::vector<std::string> scenarios = sc == "all" ? anomaly_scenarios() : std::vector<std::string>{sc};
+    std::vector<IsolationLevel> levels;
+    if (lv == "all") levels = {IsolationLevel::READ_UNCOMMITTED, IsolationLevel::READ_COMMITTED,
+                               IsolationLevel::REPEATABLE_READ, IsolationLevel::SERIALIZABLE};
+    else {
+        IsolationLevel l;
+        if (!parse_isolation(lv, l)) throw std::invalid_argument("--level must be RU|RC|RR|SER|all");
+        levels = {l};
+    }
+    JsonWriter w;
+    w.begin_object().field("kind", "measured_engine").field("policy", to_string(policy));
+    w.key("runs").begin_array();
+    for (const auto& id : scenarios)
+        for (IsolationLevel l : levels) {
+            AnomalyResult r = run_anomaly(id, l, policy);
+            w.begin_object();
+            w.field("scenario", r.scenario).field("title", r.title).field("anomaly_name", r.anomaly_name);
+            w.field("question", r.question).field("isolation", r.isolation).field("isolation_long", r.isolation_long);
+            w.field("policy", r.policy).field("anomaly", r.anomaly).field("verdict", r.verdict);
+            w.field("t1_committed", r.t1_committed).field("t2_committed", r.t2_committed);
+            w.field("lock_waits", r.lock_waits).field("deadlocks", r.deadlocks);
+            w.key("items").begin_array();
+            for (const auto& nm : r.item_names) w.value(nm);
+            w.end_array();
+            w.int_array("initial_values", r.initial_values).int_array("final_values", r.final_values);
+            w.key("events").begin_array();
+            for (const auto& e : r.events) {
+                w.begin_object().field("step", e.step).field("txn", e.txn).field("label", e.label);
+                w.field("status", e.status).field("note", e.note).field("waited", e.waited);
+                w.field("issued_tick", e.issued_tick).field("finished_tick", e.finished_tick);
+                w.field("value", static_cast<long long>(e.value)).end_object();
+            }
+            w.end_array();
+            w.key("history");
+            emit_history(w, r.history, r.item_names);
+            w.key("analysis");
+            emit_analysis(w, r.analysis);
+            w.end_object();
+        }
+    w.end_array().end_object();
+    std::cout << w.str() << "\n";
+    return 0;
+}
+
+int cmd_serial(const Args& a) {
+    auto it = a.find("schedule");
+    if (it == a.end()) throw std::invalid_argument("--schedule is required, e.g. --schedule \"R1(A) W2(A) C1 C2\"");
+    SerializabilityResult r = analyze_schedule(parse_schedule(it->second));
+    JsonWriter w;
+    w.begin_object().field("kind", "analysis").key("analysis");
+    emit_analysis(w, r);
+    w.end_object();
+    std::cout << w.str() << "\n";
+    return 0;
+}
+
+int cmd_serial_run(const Args& a) {
+    LiveRunConfig c;
+    if (!parse_isolation(get(a, "level", "SER"), c.isolation)) throw std::invalid_argument("--level must be RU|RC|RR|SER");
+    if (!parse_policy(get(a, "policy", "detect"), c.policy)) throw std::invalid_argument("--policy must be wait_die|no_wait|detect|none");
+    c.transactions = static_cast<int>(get_int(a, "txns", 6, 1, 12));
+    c.workers = static_cast<int>(get_int(a, "workers", 3, 1, 8));
+    c.records = static_cast<uint32_t>(get_int(a, "records", 3, 1, 26));
+    c.ops_per_txn = static_cast<int>(get_int(a, "ops", 3, 1, 6));
+    c.write_ratio = get_double(a, "write-ratio", 0.5, 0, 1);
+    c.think_us = static_cast<int>(get_int(a, "think-us", 300, 0, 20000));
+    c.seed = static_cast<unsigned>(get_int(a, "seed", 7, 0, 2147483647));
+    LiveRunResult r = run_live_schedule(c);
+    std::vector<std::string> names;
+    for (uint32_t k = 0; k < c.records; ++k) names.push_back(std::string(1, static_cast<char>('A' + k)));
+    JsonWriter w;
+    w.begin_object().field("kind", "measured_engine").field("isolation", r.isolation).field("policy", r.policy);
+    w.field("txns", c.transactions).field("workers", c.workers).field("records", c.records).field("ops", c.ops_per_txn);
+    w.field("write_ratio", c.write_ratio).field("think_us", c.think_us).field("seed", c.seed);
+    w.field("committed", r.committed).field("aborted_attempts", r.aborted_attempts);
+    w.field("expected_increment", r.expected_increment).field("actual_increment", r.actual_increment);
+    w.field("lost_updates", r.lost_updates);
+    w.key("history");
+    emit_history(w, r.history, names);
+    w.key("analysis");
+    emit_analysis(w, r.analysis);
+    w.end_object();
+    std::cout << w.str() << "\n";
+    return 0;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "usage: itx_cli <bench|pipeline|sched|disk|alloc|deadlock|recovery|osdeadlock> [--option value]...\n";
+        std::cerr << "usage: itx_cli <bench|pipeline|sched|disk|alloc|deadlock|recovery|osdeadlock|isolation|serial|serial-run> [--option value]...\n";
         return 2;
     }
     std::string cmd = argv[1];
@@ -433,6 +567,9 @@ int main(int argc, char** argv) {
         if (cmd == "recovery") return cmd_recovery(a);
         if (cmd == "osdeadlock") return cmd_osdeadlock(a);
         if (cmd == "pipeline") return cmd_pipeline(a);
+        if (cmd == "isolation") return cmd_isolation(a);
+        if (cmd == "serial") return cmd_serial(a);
+        if (cmd == "serial-run") return cmd_serial_run(a);
         throw std::invalid_argument("unknown command: " + cmd);
     } catch (const std::exception& e) {
         JsonWriter w;
