@@ -20,6 +20,17 @@ enum class LockMode { SHARED, EXCLUSIVE };
 //                    lock; a lock is granted only if a safe sequence still exists (all locks treated as exclusive).
 enum class LockPolicy { WAIT_DIE, NO_WAIT, DEADLOCK_DETECT, NONE, AVOID };
 
+// SQL isolation levels, implemented the classic LOCKING way (Gray et al. / SQL-92 "degrees"):
+//   READ_UNCOMMITTED : reads take NO shared lock            -> dirty reads possible
+//   READ_COMMITTED   : SHORT shared locks (released right after the read)
+//                                                           -> non-repeatable reads, lost updates possible
+//   REPEATABLE_READ  : LONG shared locks on the ROWS read, but a predicate scan locks only the
+//                      rows that currently match            -> phantoms possible
+//   SERIALIZABLE     : LONG shared locks, and a predicate scan locks every row it examines
+//                      (equivalent to a table/predicate lock) -> no anomaly (Strict 2PL)
+// Writes always take LONG exclusive locks at every level (no dirty writes).
+enum class IsolationLevel { READ_UNCOMMITTED, READ_COMMITTED, REPEATABLE_READ, SERIALIZABLE };
+
 enum class Status {
     OK,
     ABORT_WAIT_DIE,
@@ -41,5 +52,8 @@ const char* to_string(LockMode m);
 const char* to_string(LockPolicy p);
 const char* to_string(Status s);
 bool parse_policy(const std::string& text, LockPolicy& out);
+const char* to_string(IsolationLevel l);        // "RU" | "RC" | "RR" | "SER"
+const char* long_name(IsolationLevel l);        // "READ UNCOMMITTED" ...
+bool parse_isolation(const std::string& text, IsolationLevel& out);  // accepts RU/RC/RR/SER or long names
 
 }  // namespace itx
